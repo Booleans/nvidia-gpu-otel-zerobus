@@ -23,26 +23,27 @@ This example keeps that topology and swaps only the metric source (simulated) an
 (Databricks Zerobus):
 
 ```
-   simulated GPU node                         Databricks
- ┌───────────────────────────┐   OTLP/gRPC   ┌──────────────────────────────┐
- │ gpu_sim (OTel SDK)          │  (localhost)  │  OTel Collector (on-node)     │
- │  DCGM-style metrics ────────┼──────────────►│   receiver: otlp              │
- │  per GPU x N GPUs           │               │   processor: batch            │
- └───────────────────────────┘               │   exporter: otlp ──┐          │
-                                              │   auth: oauth2client│          │
-                                              └─────────────────────┼─────────┘
-                                                                     │ OTLP + OAuth
-                                                                     │ + table header
-                                                                     ▼
-                                              ┌──────────────────────────────┐
-                                              │  Zerobus OTLP endpoint         │
-                                              │   → <catalog>.<schema>.        │
-                                              │       gpu_otel_metrics (Delta) │
-                                              └──────────────────────────────┘
+   simulated GPU node                          OTel Collector (on-node)        Databricks
+                                              ┌──────────────────────────┐
+ ┌─────────────────────────┐  OTLP/gRPC       │ receiver:                │
+ │ gpu_sim (OTel SDK)       │─────────────────►│   otlp        (SDK path) │
+ └─────────────────────────┘  (localhost)      │   prometheus  (dcgm path)│
+                                    ▲          │ processor: batch         │   OTLP
+ ┌─────────────────────────┐       │ scrape   │ exporter: otlp ──────────┼────────────┐
+ │ dcgm-exporter            │───────┘ :9400    │ auth: oauth2client        │  + OAuth   │
+ │  DCGM_FI_* /metrics      │  (Prometheus)    └──────────────────────────┘  + table   │
+ └─────────────────────────┘                                                  header    ▼
+                                                            ┌──────────────────────────────┐
+                                                            │  Zerobus OTLP endpoint         │
+                                                            │   → <catalog>.<schema>.        │
+                                                            │       gpu_otel_metrics (Delta) │
+                                                            └──────────────────────────────┘
 ```
 
-In production you'd point the Collector's `prometheus` receiver at a real dcgm-exporter
-instead of running `gpu_sim`; everything downstream of the Collector is identical.
+Two receiver options into the same Collector → Zerobus pipeline: the **otlp** receiver for an
+OTel-SDK source, or the **prometheus** receiver scraping a dcgm-exporter. Everything
+downstream of the Collector is identical. On a real node you run the actual dcgm-exporter and
+point the Collector's scrape target at it — see the [dcgm-exporter path](#dcgm-exporter-path-closest-to-a-real-dgx-node).
 
 ---
 
@@ -74,10 +75,12 @@ Three ways to feed the same pipeline, in increasing fidelity to a real DGX node:
 ## Prerequisites
 
 - **Python 3.9+** and [uv](https://docs.astral.sh/uv/), with access to PyPI.
-- **`otelcol-contrib`** (the *contrib* distribution) for the production path — the
-  `oauth2client` auth extension is not in the core collector. `brew install
+- **`otelcol-contrib`** (the *contrib* distribution) for any Collector path — the
+  `oauth2client` auth extension and the `prometheus` receiver (used by the dcgm-exporter path)
+  are both contrib-only, not in the core collector. `brew install
   opentelemetry-collector-contrib`, or download from the
-  [releases](https://github.com/open-telemetry/opentelemetry-collector-releases).
+  [releases](https://github.com/open-telemetry/opentelemetry-collector-releases). (Not needed
+  for the `gpu-sim-quickstart` direct path.)
 - A **Databricks service principal** (`client_id` + OAuth secret) with the full Unity Catalog
   grant chain on the target table: **`USE CATALOG`** on the catalog, **`USE SCHEMA`** on the
   schema, **`SELECT` + `MODIFY`** on the table (see [Authentication](#authentication)).
@@ -144,13 +147,24 @@ service-discovery list. Nothing else changes.
 
 ## Verify
 
+Metric **names and attribute keys differ by path**: the OTel-SDK paths
+(`gpu-sim-production` / `gpu-sim-quickstart`) emit `gpu.*` names with dotted attribute keys
+(`gpu.id`, `cloud.provider`), while the dcgm-exporter path emits native `DCGM_FI_DEV_*` names
+with dcgm-exporter's label keys (`gpu`, `cloud_provider`). Use the block that matches the path
+you ran. (Note the `$["dotted.key"]` bracket syntax — required for keys containing a dot.)
+
+First, confirm rows landed (works for any path):
+
 ```sql
--- rows landed, one row per metric per GPU per scrape
 SELECT name, metric_type, count(*)
 FROM <catalog>.<schema>.gpu_otel_metrics
 GROUP BY name, metric_type ORDER BY name;
+```
 
--- per-cloud fleet view: attributes are queryable VARIANT (note the bracket path for dotted keys)
+**If you ran an OTel-SDK path** (`gpu-sim-production` / `gpu-sim-quickstart`):
+
+```sql
+-- per-cloud fleet view; attributes are queryable VARIANT
 SELECT
   variant_get(gauge.attributes, '$["cloud.provider"]', 'string') AS cloud,
   count(distinct variant_get(gauge.attributes, '$["gpu.id"]', 'int')) AS gpus,
@@ -165,6 +179,27 @@ SELECT variant_get(sum.attributes, '$["gpu.id"]', 'int') AS gpu,
 FROM <catalog>.<schema>.gpu_otel_metrics
 WHERE name = 'gpu.ecc.errors'
 GROUP BY gpu ORDER BY cumulative_ecc DESC;
+```
+
+**If you ran the dcgm-exporter path** (`gpu-sim-dcgm-exporter`) — native DCGM names, and
+dcgm-exporter labels (no dots, so plain `$.key` paths):
+
+```sql
+-- per-cloud fleet view
+SELECT
+  variant_get(gauge.attributes, '$.cloud_provider', 'string') AS cloud,
+  count(distinct variant_get(gauge.attributes, '$.gpu', 'string')) AS gpus,
+  round(avg(gauge.value), 1) AS avg_util
+FROM <catalog>.<schema>.gpu_otel_metrics
+WHERE name = 'DCGM_FI_DEV_GPU_UTIL'
+GROUP BY cloud ORDER BY cloud;
+
+-- the ECC counter lands in the `sum` column
+SELECT variant_get(sum.attributes, '$.Hostname', 'string') AS host,
+       max(sum.value) AS cumulative_ecc, any_value(sum.is_monotonic) AS monotonic
+FROM <catalog>.<schema>.gpu_otel_metrics
+WHERE name = 'DCGM_FI_DEV_ECC_DBE_AGG_TOTAL'
+GROUP BY host ORDER BY cumulative_ecc DESC;
 ```
 
 ---
