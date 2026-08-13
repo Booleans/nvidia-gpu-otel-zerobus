@@ -50,14 +50,24 @@ instead of running `gpu_sim`; everything downstream of the Collector is identica
 
 ```
 src/gpu_sim/
-  metrics.py       DCGM-style metric definitions + fleet simulation (shared by both entrypoints)
-  runner.py        MeterProvider / OTLP exporter wiring + CLI
-  production.py    entrypoint: export to a local Collector  (realistic node topology)
-  quickstart.py    entrypoint: export straight to Zerobus   (fewest moving parts)
-collector.yaml     OpenTelemetry Collector config (oauth2client + table-name header)
-.env.example       config template (copy to .env)
-pyproject.toml     Python deps (uv)
+  metrics.py        DCGM-style metric definitions + fleet simulation (shared by all entrypoints)
+  runner.py         MeterProvider / OTLP exporter wiring + CLI
+  production.py     entrypoint: OTel SDK -> local Collector  (realistic node topology)
+  quickstart.py     entrypoint: OTel SDK -> Zerobus direct   (fewest moving parts)
+  dcgm_exporter.py  entrypoint: simulated dcgm-exporter serving DCGM_FI_* on :9400/metrics
+collector.yaml      Collector config: otlp receiver (SDK path)         -> Zerobus
+collector-dcgm.yaml Collector config: prometheus receiver (scrape dcgm) -> Zerobus
+.env.example        config template (copy to .env)
+pyproject.toml      Python deps (uv)
 ```
+
+Three ways to feed the same pipeline, in increasing fidelity to a real DGX node:
+
+| Entrypoint | Source | Path | Closest to |
+|---|---|---|---|
+| `gpu-sim-quickstart` | OTel SDK | → Zerobus direct | a first smoke test |
+| `gpu-sim-production` | OTel SDK | → Collector → Zerobus | an app instrumented with OTel |
+| `gpu-sim-dcgm-exporter` | **dcgm-exporter** | → Collector scrape → Zerobus | **a real DGX node** |
 
 ---
 
@@ -104,6 +114,31 @@ moving parts, but credentials live in the workload — prefer the Collector on r
 # .env must have ZEROBUS_OTLP_ENDPOINT, DATABRICKS_TOKEN (an OAuth access token), ZEROBUS_TABLE
 uv run gpu-sim-quickstart --hosts 4 --gpus-per-host 8 --iterations 6
 ```
+
+### dcgm-exporter path (closest to a real DGX node)
+
+This is the production topology: **dcgm-exporter** serves DCGM fields in Prometheus format on
+`:9400/metrics`, and the Collector's `prometheus` receiver scrapes them. Here we fake the
+exporter; on a real node you'd run the actual
+[dcgm-exporter](https://github.com/NVIDIA/dcgm-exporter) and change only the scrape target.
+
+```bash
+# terminal 1 — the (simulated) dcgm-exporter, real DCGM_FI_* names + labels
+uv run gpu-sim-dcgm-exporter --hosts 4 --gpus-per-host 8 --port 9400
+#   sanity check:  curl localhost:9400/metrics
+
+# terminal 2 — the Collector scrapes :9400 and forwards to Zerobus
+set -a; . ./.env; set +a
+otelcol-contrib --config collector-dcgm.yaml
+```
+
+Metrics land under their native DCGM names (`DCGM_FI_DEV_GPU_UTIL`, `DCGM_FI_DEV_GPU_TEMP`,
+`DCGM_FI_DEV_ECC_DBE_AGG_TOTAL`, …) with dcgm-exporter's labels (`gpu`, `UUID`, `modelName`,
+`Hostname`) preserved as VARIANT attributes.
+
+**To use a real dcgm-exporter:** skip terminal 1 and point `collector-dcgm.yaml`'s
+`scrape_configs.targets` at your dcgm-exporter endpoint(s) — one per node, or a
+service-discovery list. Nothing else changes.
 
 ---
 

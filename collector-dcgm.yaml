@@ -1,0 +1,56 @@
+# Collector config for the dcgm-exporter variant: SCRAPE Prometheus metrics from a
+# dcgm-exporter (real or simulated) and forward them to Zerobus over OTLP.
+#
+# This is the production DGX topology: dcgm-exporter serves DCGM_FI_* fields on :9400/metrics,
+# the Collector's prometheus receiver scrapes them, and the otlp exporter ships them to
+# Databricks. To use a REAL dcgm-exporter, just change the scrape target below.
+#
+# Requires otelcol-contrib (oauth2client + prometheus receiver). Run:
+#   otelcol-contrib --config collector-dcgm.yaml
+# with the same env vars as collector.yaml (see .env.example).
+
+extensions:
+  oauth2client/metrics:
+    client_id: ${env:DATABRICKS_CLIENT_ID}
+    client_secret: ${env:DATABRICKS_CLIENT_SECRET}
+    token_url: https://${env:WORKSPACE_URL}/oidc/v1/token
+    scopes: ["all-apis"]
+    endpoint_params:
+      resource: "api://databricks/workspaces/${env:WORKSPACE_ID}/zerobusDirectWriteApi"
+      authorization_details:
+        - '[{"type":"unity_catalog_privileges","privileges":["USE CATALOG"],"object_type":"CATALOG","object_full_path":"${env:CATALOG}"},{"type":"unity_catalog_privileges","privileges":["USE SCHEMA"],"object_type":"SCHEMA","object_full_path":"${env:CATALOG}.${env:SCHEMA}"},{"type":"unity_catalog_privileges","privileges":["SELECT","MODIFY"],"object_type":"TABLE","object_full_path":"${env:CATALOG}.${env:SCHEMA}.${env:TABLE_NAME}"}]'
+
+receivers:
+  # Scrape dcgm-exporter's Prometheus endpoint. Point `targets` at the real dcgm-exporter(s)
+  # in production (typically one per node, or a service-discovery list).
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: dcgm
+          scrape_interval: 5s
+          static_configs:
+            - targets: ["localhost:9400"]
+
+processors:
+  batch:
+    timeout: 5s
+    send_batch_size: 1000
+
+exporters:
+  otlp/metrics:
+    endpoint: ${env:ZEROBUS_ENDPOINT}
+    auth:
+      authenticator: oauth2client/metrics
+    headers:
+      x-databricks-zerobus-table-name: ${env:ZEROBUS_TABLE}
+
+service:
+  extensions: [oauth2client/metrics]
+  pipelines:
+    metrics:
+      receivers: [prometheus]
+      processors: [batch]
+      exporters: [otlp/metrics]
+  telemetry:
+    logs:
+      level: info

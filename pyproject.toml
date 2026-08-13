@@ -14,6 +14,8 @@ dependencies = [
 #   production -> export OTLP to a local Collector that holds the OAuth + table header
 gpu-sim-quickstart = "gpu_sim.quickstart:main"
 gpu-sim-production = "gpu_sim.production:main"
+# dcgm-exporter variant: serve DCGM_FI_* metrics in Prometheus format for a Collector to scrape
+gpu-sim-dcgm-exporter = "gpu_sim.dcgm_exporter:main"
 
 [build-system]
 requires = ["hatchling"]
