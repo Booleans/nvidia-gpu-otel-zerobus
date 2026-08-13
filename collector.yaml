@@ -1,0 +1,70 @@
+# OpenTelemetry Collector config: receive OTLP from a GPU node and forward it to Databricks
+# Zerobus, which writes it into the target Delta table.
+#
+# This is the piece that would run ON each DGX node (or as a per-rack gateway). It holds the
+# service-principal OAuth credentials and the target-table header, so the workload that emits
+# metrics never sees credentials -- it just speaks plain OTLP to localhost.
+#
+# REQUIRES the *contrib* distribution (otelcol-contrib): the oauth2client auth extension is
+# not in the core collector. Run with:
+#   otelcol-contrib --config collector.yaml
+# with these env vars set (see .env.example):
+#   DATABRICKS_CLIENT_ID, DATABRICKS_CLIENT_SECRET, WORKSPACE_URL, WORKSPACE_ID,
+#   ZEROBUS_ENDPOINT, ZEROBUS_TABLE
+
+extensions:
+  # Exchanges the service principal's client_id/secret for a short-lived OAuth token and
+  # refreshes it automatically. The `resource` endpoint param scopes the token to Zerobus's
+  # direct-write API -- required, or the token is rejected at ingest.
+  oauth2client/metrics:
+    client_id: ${env:DATABRICKS_CLIENT_ID}
+    client_secret: ${env:DATABRICKS_CLIENT_SECRET}
+    token_url: https://${env:WORKSPACE_URL}/oidc/v1/token
+    scopes: ["all-apis"]
+    endpoint_params:
+      resource: "api://databricks/workspaces/${env:WORKSPACE_ID}/zerobusDirectWriteApi"
+      # Zerobus requires the access token to carry a Unity Catalog `authorization_details`
+      # claim enumerating the full privilege chain to the target table -- USE CATALOG on the
+      # catalog, USE SCHEMA on the schema, SELECT+MODIFY on the table. Without it the token is
+      # issued but ingest fails with "Missing authorization details in access token claims".
+      # (The SP must actually hold these grants too; this claim requests them into the token.)
+      authorization_details:
+        - '[{"type":"unity_catalog_privileges","privileges":["USE CATALOG"],"object_type":"CATALOG","object_full_path":"${env:CATALOG}"},{"type":"unity_catalog_privileges","privileges":["USE SCHEMA"],"object_type":"SCHEMA","object_full_path":"${env:CATALOG}.${env:SCHEMA}"},{"type":"unity_catalog_privileges","privileges":["SELECT","MODIFY"],"object_type":"TABLE","object_full_path":"${env:CATALOG}.${env:SCHEMA}.${env:TABLE_NAME}"}]'
+
+receivers:
+  # Accept OTLP from the simulated GPU node(s) on the standard ports.
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # Coalesce many data points into few export requests -- this is where OTLP batching
+  # happens (one request carries a whole scrape interval across all GPUs), which is what
+  # keeps request rate low at fleet scale.
+  batch:
+    timeout: 5s
+    send_batch_size: 1000
+
+exporters:
+  # Forward to the Zerobus OTLP endpoint. The table-name header selects the target Delta
+  # table (one table per exporter); auth is delegated to the oauth2client extension above.
+  otlp/metrics:
+    endpoint: ${env:ZEROBUS_ENDPOINT}
+    auth:
+      authenticator: oauth2client/metrics
+    headers:
+      x-databricks-zerobus-table-name: ${env:ZEROBUS_TABLE}
+
+service:
+  extensions: [oauth2client/metrics]
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp/metrics]
+  telemetry:
+    logs:
+      level: info
