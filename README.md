@@ -95,14 +95,19 @@ Three ways to feed the same pipeline, in increasing fidelity to a real DGX node:
 # 1. install deps
 uv sync
 
-# 2. configure
-cp .env.example .env      # then fill in workspace, SP, and table values
+# 2. configure — copy the template, then fill in every value: the catalog/schema/table,
+#    the workspace host + id, and the service-principal id + secret
+cp .env.example .env
 
-# 3. run the on-node Collector (holds the OAuth creds + table header)
+# 3. create the target Delta table (Zerobus never creates it) — edit table.sql to set your
+#    <catalog>.<schema>, run it once in a Databricks SQL editor or notebook, and grant the
+#    service principal access (see "The table" and "Authentication" below)
+
+# 4. run the on-node Collector (holds the OAuth creds + table header)
 set -a; . ./.env; set +a
 otelcol-contrib --config collector.yaml     # leave running in one terminal
 
-# 4. in another terminal, simulate a GPU fleet exporting to the local Collector
+# 5. in another terminal, simulate a GPU fleet exporting to the local Collector
 uv run gpu-sim-production --hosts 4 --gpus-per-host 8 --iterations 6 --interval 2
 ```
 
@@ -111,10 +116,14 @@ uv run gpu-sim-production --hosts 4 --gpus-per-host 8 --iterations 6 --interval 
 ### Simplest path (no Collector)
 
 The app can export straight to Zerobus, carrying the token and table header itself. Fewer
-moving parts, but credentials live in the workload — prefer the Collector on real nodes.
+moving parts, but two catches: credentials live in the workload (prefer the Collector on real
+nodes), and you must supply a ready-made OAuth **access token** that already carries the Unity
+Catalog `authorization_details` claim — the Collector mints that for you, but on this path you
+mint it yourself (see [Authentication](#authentication)).
 
 ```bash
-# .env must have ZEROBUS_OTLP_ENDPOINT, DATABRICKS_TOKEN (an OAuth access token), ZEROBUS_TABLE
+# .env must have ZEROBUS_OTLP_ENDPOINT, DATABRICKS_TOKEN (the access token), ZEROBUS_TABLE
+set -a; . ./.env; set +a
 uv run gpu-sim-quickstart --hosts 4 --gpus-per-host 8 --iterations 6
 ```
 
@@ -160,6 +169,11 @@ SELECT name, metric_type, count(*)
 FROM <catalog>.<schema>.gpu_otel_metrics
 GROUP BY name, metric_type ORDER BY name;
 ```
+
+On the dcgm-exporter path you'll also see Prometheus scrape meta-metrics — `up`,
+`scrape_duration_seconds`, `scrape_samples_scraped`, … — landing alongside the `DCGM_FI_*`
+rows; the `prometheus` receiver emits them each scrape. They're harmless; add `WHERE name LIKE
+'DCGM%'` to ignore them.
 
 **If you ran an OTel-SDK path** (`gpu-sim-production` / `gpu-sim-quickstart`):
 
@@ -239,6 +253,28 @@ Mint the SP OAuth secret (used by the Collector) with:
 databricks service-principal-secrets-proxy create <sp-numeric-id> \
   --profile <profile> --lifetime 86400s
 ```
+
+(A service principal has two identifiers: the **numeric id** used in the command above, and
+the **application (client) id** — a UUID — used in the `GRANT` statements and as
+`DATABRICKS_CLIENT_ID`.)
+
+**Direct path only — mint an access token.** The Collector's `oauth2client` extension performs
+this exchange automatically; for `gpu-sim-quickstart` you do it by hand, and the token must
+carry the same `authorization_details` claim or ingest fails. `DATABRICKS_TOKEN` is the
+`access_token` field from:
+
+```bash
+curl -sS --request POST \
+  "https://<workspace-host>.cloud.databricks.com/oidc/v1/token" \
+  --user "<sp-application-id>:<sp-oauth-secret>" \
+  --data grant_type=client_credentials \
+  --data scope=all-apis \
+  --data 'resource=api://databricks/workspaces/<workspace-id>/zerobusDirectWriteApi' \
+  --data-urlencode 'authorization_details=[{"type":"unity_catalog_privileges","privileges":["USE CATALOG"],"object_type":"CATALOG","object_full_path":"<catalog>"},{"type":"unity_catalog_privileges","privileges":["USE SCHEMA"],"object_type":"SCHEMA","object_full_path":"<catalog>.<schema>"},{"type":"unity_catalog_privileges","privileges":["SELECT","MODIFY"],"object_type":"TABLE","object_full_path":"<catalog>.<schema>.gpu_otel_metrics"}]'
+```
+
+The access token is short-lived — re-mint when it expires. (This is exactly what
+`collector.yaml`'s `oauth2client` block automates for the Collector paths.)
 
 Endpoint format (AWS): `https://<workspace-id>.zerobus.<region>.cloud.databricks.com:443`.
 
